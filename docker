@@ -1,0 +1,20 @@
+FROM python:3.9
+# Install system dependencies (PowerShell if needed)
+RUN apt-get update && \
+    apt-get install -y wget apt-transport-https software-properties-common && \
+    wget -q https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb && \
+    dpkg -i packages-microsoft-prod.deb && \
+    apt-get update && \
+    apt-get install -y powershell && \
+    rm packages-microsoft-prod.deb
+
+WORKDIR /workspace
+
+# Copy requirements first for layer caching
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all files (excluding those in .dockerignore)
+COPY . .
+
+CMD ["python", "auto.py"]

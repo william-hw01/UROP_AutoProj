@@ -1,0 +1,2 @@
+open docker: docker start -ai 85f61c031ef1
+Mount the Entire Directory: docker run -it -v "$(pwd):/workspace" -w /workspace autoproj /bin/bash
