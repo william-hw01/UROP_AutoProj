@@ -6,7 +6,8 @@ from datetime import datetime
 import subprocess
 import re
 
-load_dotenv()
+# Load environment variables from /app (where files are copied during build)
+load_dotenv("/app/environment.env")
 API_KEY = "sk-ldlznymtwuosilumwyqsxkusuwllbzbvcmviebypcbqnxsso"
 
 # Check if API key is loaded
@@ -56,21 +57,56 @@ def call_deepseek(prompt):
         response = requests.post(API_URL, headers=headers, json=payload)
         response.raise_for_status()
         response_data = response.json()
-        # Save response to a JSON file with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # e.g., 20250605_1510
+        # Save response to a JSON file in /tmp (ephemeral)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # e.g., 20250605_1620
         filename = f"response_{timestamp}.json"
-        with open(os.path.join("/workspace", filename), "w") as f:
+        json_path = os.path.join("/tmp", filename)
+        with open(json_path, "w") as f:
             json.dump(response_data, f, indent=4)
         
         content = response_data["choices"][0]["message"]["content"]
+        print("API Response Content:\n", content)  # Debug: Print the full response
+
         # Extract and execute PowerShell command if present
         powershell_command = extract_powershell_command(content)
         if powershell_command:
             try:
-                subprocess.run(["pwsh", "-Command", powershell_command], check=True, text=True)
+                # Adjust PowerShell command to create directories in /tmp
+                original_command = powershell_command
+                if "New-Item" in powershell_command or "mkdir" in powershell_command:
+                    # Replace TestFolder with /tmp/TestFolder
+                    if "New-Item" in powershell_command:
+                        powershell_command = powershell_command.replace("TestFolder", "/tmp/TestFolder")
+                    elif "mkdir" in powershell_command:
+                        powershell_command = powershell_command.replace("TestFolder", "/tmp/TestFolder")
+                print(f"Original PowerShell Command: {original_command}")
+                print(f"Modified PowerShell Command: {powershell_command}")
+
+                # Execute the command and capture output
+                result = subprocess.run(
+                    ["pwsh", "-Command", powershell_command],
+                    check=True,
+                    text=True,
+                    capture_output=True
+                )
                 print("PowerShell command executed successfully!")
+                if result.stdout:
+                    print(f"PowerShell stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"PowerShell stderr: {result.stderr}")
+
+                # Verify directory creation
+                if os.path.exists("/tmp/TestFolder"):
+                    print("TestFolder created successfully at /tmp/TestFolder")
+                    print("Contents of TestFolder:", os.listdir("/tmp/TestFolder"))
+                else:
+                    print("TestFolder was not created at /tmp/TestFolder")
             except subprocess.CalledProcessError as e:
                 print(f"Error executing PowerShell command: {e}")
+                print(f"PowerShell stdout: {e.stdout}")
+                print(f"PowerShell stderr: {e.stderr}")
+        else:
+            print("No PowerShell command extracted from the response.")
         return content
     except requests.exceptions.HTTPError as e:
         error_msg = e.response.text if e.response.text else "No detailed error message available"
@@ -93,19 +129,22 @@ def extract_powershell_command(text):
     for line in lines:
         line = line.strip()
         if line.startswith('```'):
-            if in_code_block and current_language in ['powershell', '']:
-                # End of code block, process accumulated commands
-                break
-            in_code_block = not in_code_block
-            current_language = line[3:].strip() if in_code_block else None
+            if in_code_block:
+                in_code_block = False
+                current_language = None
+            else:
+                in_code_block = True
+                current_language = line[3:].strip()
             continue
         if in_code_block and current_language in ['powershell', '']:
             if line and not line.startswith('#'):  # Ignore comments
                 # Check for valid PowerShell syntax
                 if (re.match(r'^\$[a-zA-Z]+\..*', line) or  # e.g., $host.UI.RawUI...
                     re.match(r'^Set-\w+\s+-', line) or    # e.g., Set-ItemProperty...
-                    re.match(r'^[a-zA-Z]+\s+', line)):    # e.g., Clear-Host
-                    commands.append(line)
+                    re.match(r'^[a-zA-Z]+\s+', line) or   # e.g., New-Item..., mkdir...
+                    line.lower().startswith('mkdir')):    # e.g., mkdir TestFolder
+                    if 'WallPaper' not in line or 'C:\\Path\\To\\Your\\Image.jpg' in line:
+                        commands.append(line)
                 elif re.match(r'^color\s+[0-9A-F]{2}', line.lower()):  # CMD color command
                     fg_color = line.split()[1][0].upper()
                     bg_color = line.split()[1][1].upper()

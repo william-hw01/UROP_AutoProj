@@ -1,1 +1,2 @@
-can you give me windows command to change the powershell background color to DarkRed?
+can you give me windows command to change the powershell background color to DarkRed? //ok
+Give me a PowerShell command to create a new directory named 'TestFolder' in the current directory.
