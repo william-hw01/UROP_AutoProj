@@ -6,13 +6,12 @@ from datetime import datetime
 import subprocess
 import re
 
-# Load environment variables from /app (where files are copied during build)
+# Load environment variables
 load_dotenv("/app/environment.env")
-API_KEY = "sk-ldlznymtwuosilumwyqsxkusuwllbzbvcmviebypcbqnxsso"
+API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-ldlznymtwuosilumwyqsxkusuwllbzbvcmviebypcbqnxsso")
 
-# Check if API key is loaded
 if not API_KEY:
-    raise ValueError("DEEPSEEK_API_KEY is not set in the environment. Please check environment.env.")
+    raise ValueError("API key is not set. Please check your environment configuration.")
 
 API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
@@ -23,166 +22,156 @@ def call_deepseek(prompt):
     }
     payload = {
         "model": "Qwen/QwQ-32B",
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "max_tokens": 512,
-        "thinking_budget": 4096,
-        "min_p": 0.05,
-        "stop": None,
         "temperature": 0.7,
         "top_p": 0.7,
-        "top_k": 50,
-        "frequency_penalty": 0.5,
-        "n": 1,
         "response_format": {"type": "text"},
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "description": "<string>",
-                    "name": "<string>",
-                    "parameters": {},
-                    "strict": False
-                }
-            }
-        ]
     }
 
-    # Iteration logic to retry API call if no command is extracted
-    max_iterations = 3  # Maximum number of attempts
-    iteration_no = 1
+    max_attempts = 3
     powershell_command = None
-    content = None
-    response_data = None
+    response_content = None
 
-    
-    try:
-        while iteration_no <= max_iterations and powershell_command is None:
-            print(f"\nAttempting to extract PowerShell command (Iteration {iteration_no})...")
+    for attempt in range(1, max_attempts + 1):
+        print(f"\nAttempt {attempt} of {max_attempts}...")
+        try:
             response = requests.post(API_URL, headers=headers, json=payload)
             response.raise_for_status()
             response_data = response.json()
-            content = response_data["choices"][0]["message"]["content"]
-            powershell_command = extract_powershell_command(content)
+            response_content = response_data["choices"][0]["message"]["content"]
+            
+            # Save response for debugging
+            save_response(response_data, attempt)
+            
+            powershell_command = extract_powershell_command(response_content)
             if powershell_command:
-                print(f"PowerShell command extracted successfully on iteration {iteration_no}.")
+                print("PowerShell command extracted successfully.")
+                execute_powershell_command(powershell_command)
                 break
-            else:
-                print(f"No PowerShell command extracted on iteration {iteration_no}. Retrying...")
-                iteration_no += 1
-        # Save response to a JSON file in /app (ephemeral)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # e.g., 20250606_0936
-        filename = f"response_{timestamp}_iteration_{iteration_no}.json"
-        json_path = os.path.join("/app", filename)
-        with open(json_path, "w") as f:
-            json.dump(response_data, f, indent=4)
-        
-    except requests.exceptions.HTTPError as e:
-        error_msg = e.response.text if e.response.text else "No detailed error message available"
-        try:
-            error_data = e.response.json()
-            error_msg = error_data.get("message", error_msg)
-        except ValueError:
-            pass
-        return f"API Error (HTTP {e.response.status_code}): {error_msg}"
-    except Exception as e:
-        return f"Connection Error: {str(e)}"
+                
+        except requests.exceptions.HTTPError as e:
+            error_msg = get_error_message(e)
+            return f"API Error: {error_msg}"
+        except Exception as e:
+            return f"Error: {str(e)}"
 
-    if powershell_command is None:
-        print(f"Failed to extract a PowerShell command after {max_iterations} iterations.")
-        return content if content else "No response content available."
+    return response_content if response_content else "No response received."
 
-    # Execute the extracted PowerShell command
+def save_response(response_data, attempt):
+    """Save API response to a JSON file for debugging."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"response_{timestamp}_attempt_{attempt}.json"
+    json_path = os.path.join("/app", filename)
+    with open(json_path, "w") as f:
+        json.dump(response_data, f, indent=4)
+
+def get_error_message(http_error):
+    """Extract error message from HTTP error response."""
+    error_msg = http_error.response.text if http_error.response.text else "No detailed error message"
     try:
-        # Adjust PowerShell command to create directories in /app
-        original_command = powershell_command
-        if "New-Item" in powershell_command or "mkdir" in powershell_command:
-            # Replace TestFolder with /app/TestFolder
-            if "New-Item" in powershell_command:
-                powershell_command = powershell_command.replace("TestFolder", "/app/TestFolder")
-            elif "mkdir" in powershell_command:
-                powershell_command = powershell_command.replace("TestFolder", "/app/TestFolder")
-        print(f"Original PowerShell Command: {original_command}")
-        print(f"Modified PowerShell Command: {powershell_command}")
+        error_data = http_error.response.json()
+        return error_data.get("message", error_msg)
+    except ValueError:
+        return error_msg
 
-        # Execute the command and capture output
+def extract_powershell_command(text):
+    """
+    Extract PowerShell commands from text with more flexible pattern matching.
+    Handles both code blocks and inline commands.
+    """
+    # Pattern for code blocks
+    code_block_pattern = r'```(?:powershell)?\n(.*?)\n```'
+    code_blocks = re.findall(code_block_pattern, text, re.DOTALL)
+    
+    # Pattern for inline commands (between backticks or on their own line)
+    inline_pattern = r'(?:`|^)((?:New-Item|mkdir|Set-|Get-|Remove-|Start-|Stop-|Write-|Invoke-|Select-|Where-|\$)[^`\n]+)(?:`|$)'
+    inline_commands = re.findall(inline_pattern, text, re.IGNORECASE)
+    
+    # Combine all potential commands
+    all_commands = []
+    for block in code_blocks:
+        all_commands.extend([cmd.strip() for cmd in block.split('\n') if cmd.strip()])
+    
+    all_commands.extend(inline_commands)
+    
+    # Filter out comments and empty commands
+    valid_commands = [
+        cmd for cmd in all_commands 
+        if cmd and not cmd.startswith('#') and not cmd.startswith('//')
+    ]
+    
+    return valid_commands[0] if valid_commands else None
+
+def execute_powershell_command(command):
+    """Execute a PowerShell command with safety checks and proper output handling."""
+    print(f"\nExecuting PowerShell command: {command}")
+    
+    try:
+        # Basic safety check - don't execute potentially dangerous commands
+        if is_potentially_dangerous(command):
+            raise ValueError("Command appears potentially dangerous and was blocked")
+        
+        # Execute the command
         result = subprocess.run(
-            ["pwsh", "-Command", powershell_command],
+            ["pwsh", "-Command", command],
             check=True,
             text=True,
             capture_output=True
         )
-        print("PowerShell command executed successfully!")
+        
+        # Print results
         if result.stdout:
-            print(f"PowerShell stdout: {result.stdout}")
+            print(f"Command output:\n{result.stdout}")
         if result.stderr:
-            print(f"PowerShell stderr: {result.stderr}")
-
-        # Verify directory creation
-        if os.path.exists("/app/TestFolder"):
-            print("TestFolder created successfully at /app/TestFolder")
-            print("Contents of TestFolder:", os.listdir("/app/TestFolder"))
-        else:
-            print("TestFolder was not created at /app/TestFolder")
+            print(f"Command errors:\n{result.stderr}")
+            
+        return True
+        
     except subprocess.CalledProcessError as e:
-        print(f"Error executing PowerShell command: {e}")
-        print(f"PowerShell stdout: {e.stdout}")
-        print(f"PowerShell stderr: {e.stderr}")
+        print(f"Command failed with error: {e}")
+        print(f"Output: {e.stdout}")
+        print(f"Errors: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"Error executing command: {e}")
+        return False
 
-    return content
-
-def extract_powershell_command(text):
-    # Look for code blocks and extract PowerShell commands
-    commands = []
-    in_code_block = False
-    current_language = None
-    lines = text.split('\n')
-
-    for line in lines:
-        line = line.strip()
-        if line.startswith('```'):
-            if in_code_block:
-                in_code_block = False
-                current_language = None
-            else:
-                in_code_block = True
-                current_language = line[3:].strip()
-            continue
-        if in_code_block and current_language in ['powershell', '']:
-            if line and not line.startswith('#'):  # Ignore comments
-                # Check for valid PowerShell syntax
-                if (re.match(r'^\$[a-zA-Z]+\..*', line) or  # e.g., $host.UI.RawUI...
-                    re.match(r'^Set-\w+\s+-', line) or    # e.g., Set-ItemProperty...
-                    re.match(r'^[a-zA-Z]+\s+', line) or   # e.g., New-Item..., mkdir...
-                    line.lower().startswith('mkdir')):    # e.g., mkdir TestFolder
-                    if 'WallPaper' not in line or 'C:\\Path\\To\\Your\\Image.jpg' in line:
-                        commands.append(line)
-                elif re.match(r'^color\s+[0-9A-F]{2}', line.lower()):  # CMD color command
-                    fg_color = line.split()[1][0].upper()
-                    bg_color = line.split()[1][1].upper()
-                    powershell_cmd = f"$host.UI.RawUI.BackgroundColor = '{color_map.get(bg_color, 'Gray')}'; Clear-Host"
-                    commands.append(powershell_cmd)
-
-    return commands[0] if commands else None
-
-# Color map for CMD to PowerShell color conversion
-color_map = {
-    '0': 'Black', '1': 'DarkBlue', '2': 'DarkGreen', '3': 'DarkCyan',
-    '4': 'DarkRed', '5': 'DarkMagenta', '6': 'DarkYellow', '7': 'Gray',
-    '8': 'DarkGray', '9': 'Blue', 'A': 'Green', 'B': 'Cyan',
-    'C': 'Red', 'D': 'Magenta', 'E': 'Yellow', 'F': 'White'
-}
+def is_potentially_dangerous(command):
+    """Check if a command appears to be potentially dangerous."""
+    dangerous_patterns = [
+        r'Remove-Item\s+[^-]',  # Remove-Item without -WhatIf or -Confirm
+        r'Format-Volume',
+        r'Stop-Process\s+-Id\s+\d+',
+        r'Restart-Computer',
+        r'Invoke-Expression',
+        r'Invoke-Command',
+        r'Start-Process\s+.*\.exe',
+        r'Set-ExecutionPolicy',
+        r'net\s+user',
+        r'reg\s+(add|delete)',
+        r'schtasks\s+',
+    ]
+    
+    lower_command = command.lower()
+    return any(re.search(pattern, lower_command, re.IGNORECASE) for pattern in dangerous_patterns)
 
 if __name__ == "__main__":
-    print("DeepSeek Chat (type 'q' to exit)")
+    print("DeepSeek Chat PowerShell Assistant (type 'quit' or 'exit' to end)")
     while True:
-        user_input = input("\nYou: ")
-        if user_input.lower() == "q":
+        try:
+            user_input = input("\nYour request: ").strip()
+            if user_input.lower() in ('q', 'quit', 'exit'):
+                break
+            if not user_input:
+                continue
+                
+            result = call_deepseek(user_input)
+            print("\nAssistant:", result)
+            
+        except KeyboardInterrupt:
+            print("\nExiting...")
             break
-        result = call_deepseek(user_input)
-        print("\nDeepSeek:", result)
+        except Exception as e:
+            print(f"An error occurred: {e}")
