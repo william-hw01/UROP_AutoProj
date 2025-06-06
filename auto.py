@@ -53,61 +53,35 @@ def call_deepseek(prompt):
         ]
     }
 
+    # Iteration logic to retry API call if no command is extracted
+    max_iterations = 3  # Maximum number of attempts
+    iteration_no = 1
+    powershell_command = None
+    content = None
+    response_data = None
+
+    
     try:
-        response = requests.post(API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        response_data = response.json()
-        # Save response to a JSON file in /tmp (ephemeral)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # e.g., 20250605_1620
-        filename = f"response_{timestamp}.json"
-        json_path = os.path.join("/tmp", filename)
+        while iteration_no <= max_iterations and powershell_command is None:
+            print(f"\nAttempting to extract PowerShell command (Iteration {iteration_no})...")
+            response = requests.post(API_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            response_data = response.json()
+            content = response_data["choices"][0]["message"]["content"]
+            powershell_command = extract_powershell_command(content)
+            if powershell_command:
+                print(f"PowerShell command extracted successfully on iteration {iteration_no}.")
+                break
+            else:
+                print(f"No PowerShell command extracted on iteration {iteration_no}. Retrying...")
+                iteration_no += 1
+        # Save response to a JSON file in /app (ephemeral)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # e.g., 20250606_0936
+        filename = f"response_{timestamp}_iteration_{iteration_no}.json"
+        json_path = os.path.join("/app", filename)
         with open(json_path, "w") as f:
             json.dump(response_data, f, indent=4)
         
-        content = response_data["choices"][0]["message"]["content"]
-        print("API Response Content:\n", content)  # Debug: Print the full response
-
-        # Extract and execute PowerShell command if present
-        powershell_command = extract_powershell_command(content)
-        if powershell_command:
-            try:
-                # Adjust PowerShell command to create directories in /tmp
-                original_command = powershell_command
-                if "New-Item" in powershell_command or "mkdir" in powershell_command:
-                    # Replace TestFolder with /tmp/TestFolder
-                    if "New-Item" in powershell_command:
-                        powershell_command = powershell_command.replace("TestFolder", "/tmp/TestFolder")
-                    elif "mkdir" in powershell_command:
-                        powershell_command = powershell_command.replace("TestFolder", "/tmp/TestFolder")
-                print(f"Original PowerShell Command: {original_command}")
-                print(f"Modified PowerShell Command: {powershell_command}")
-
-                # Execute the command and capture output
-                result = subprocess.run(
-                    ["pwsh", "-Command", powershell_command],
-                    check=True,
-                    text=True,
-                    capture_output=True
-                )
-                print("PowerShell command executed successfully!")
-                if result.stdout:
-                    print(f"PowerShell stdout: {result.stdout}")
-                if result.stderr:
-                    print(f"PowerShell stderr: {result.stderr}")
-
-                # Verify directory creation
-                if os.path.exists("/tmp/TestFolder"):
-                    print("TestFolder created successfully at /tmp/TestFolder")
-                    print("Contents of TestFolder:", os.listdir("/tmp/TestFolder"))
-                else:
-                    print("TestFolder was not created at /tmp/TestFolder")
-            except subprocess.CalledProcessError as e:
-                print(f"Error executing PowerShell command: {e}")
-                print(f"PowerShell stdout: {e.stdout}")
-                print(f"PowerShell stderr: {e.stderr}")
-        else:
-            print("No PowerShell command extracted from the response.")
-        return content
     except requests.exceptions.HTTPError as e:
         error_msg = e.response.text if e.response.text else "No detailed error message available"
         try:
@@ -118,6 +92,49 @@ def call_deepseek(prompt):
         return f"API Error (HTTP {e.response.status_code}): {error_msg}"
     except Exception as e:
         return f"Connection Error: {str(e)}"
+
+    if powershell_command is None:
+        print(f"Failed to extract a PowerShell command after {max_iterations} iterations.")
+        return content if content else "No response content available."
+
+    # Execute the extracted PowerShell command
+    try:
+        # Adjust PowerShell command to create directories in /app
+        original_command = powershell_command
+        if "New-Item" in powershell_command or "mkdir" in powershell_command:
+            # Replace TestFolder with /app/TestFolder
+            if "New-Item" in powershell_command:
+                powershell_command = powershell_command.replace("TestFolder", "/app/TestFolder")
+            elif "mkdir" in powershell_command:
+                powershell_command = powershell_command.replace("TestFolder", "/app/TestFolder")
+        print(f"Original PowerShell Command: {original_command}")
+        print(f"Modified PowerShell Command: {powershell_command}")
+
+        # Execute the command and capture output
+        result = subprocess.run(
+            ["pwsh", "-Command", powershell_command],
+            check=True,
+            text=True,
+            capture_output=True
+        )
+        print("PowerShell command executed successfully!")
+        if result.stdout:
+            print(f"PowerShell stdout: {result.stdout}")
+        if result.stderr:
+            print(f"PowerShell stderr: {result.stderr}")
+
+        # Verify directory creation
+        if os.path.exists("/app/TestFolder"):
+            print("TestFolder created successfully at /app/TestFolder")
+            print("Contents of TestFolder:", os.listdir("/app/TestFolder"))
+        else:
+            print("TestFolder was not created at /app/TestFolder")
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing PowerShell command: {e}")
+        print(f"PowerShell stdout: {e.stdout}")
+        print(f"PowerShell stderr: {e.stderr}")
+
+    return content
 
 def extract_powershell_command(text):
     # Look for code blocks and extract PowerShell commands

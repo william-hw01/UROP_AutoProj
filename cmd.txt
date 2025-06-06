@@ -1,2 +1,6 @@
-open docker: docker start -ai 85f61c031ef1
+git pull origin main
+git add .
+git commit -m "Ver0.2.1"
+git push origin main   
+open docker: docker run --rm -it -w /app autoproj /bin/bash   
 Mount the Entire Directory: docker run -it -v "$(pwd):/workspace" -w /workspace autoproj /bin/bash
