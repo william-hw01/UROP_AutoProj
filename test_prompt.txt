@@ -1,2 +1,4 @@
 can you give me windows command to change the powershell background color to DarkRed? 
 Give me a PowerShell command to create a new directory named 'TestFolder' in the current directory. //ok
+Give me a PowerShell command to create a new directory named 'TestFolder' in the current directory. Then generate test.txt inside the TestFolder//ok
+How to directly run test.py? Assume I already inside the folder which contain this python code, how to run it in powershell?

@@ -24,14 +24,14 @@ def call_deepseek(prompt):
         "model": "Qwen/QwQ-32B",
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "max_tokens": 512,
+        "max_tokens": 1024,  # Increased to allow for multiple commands
         "temperature": 0.7,
         "top_p": 0.7,
         "response_format": {"type": "text"},
     }
 
     max_attempts = 3
-    powershell_command = None
+    powershell_commands = []
     response_content = None
 
     for attempt in range(1, max_attempts + 1):
@@ -45,10 +45,10 @@ def call_deepseek(prompt):
             # Save response for debugging
             save_response(response_data, attempt)
             
-            powershell_command = extract_powershell_command(response_content)
-            if powershell_command:
-                print("PowerShell command extracted successfully.")
-                execute_powershell_command(powershell_command)
+            powershell_commands = extract_powershell_commands(response_content)
+            if powershell_commands:
+                print(f"Found {len(powershell_commands)} PowerShell command(s).")
+                execute_powershell_commands(powershell_commands)
                 break
                 
         except requests.exceptions.HTTPError as e:
@@ -76,67 +76,113 @@ def get_error_message(http_error):
     except ValueError:
         return error_msg
 
-def extract_powershell_command(text):
+def extract_powershell_commands(text):
     """
-    Extract PowerShell commands from text with more flexible pattern matching.
-    Handles both code blocks and inline commands.
+    Extract multiple PowerShell commands from text.
+    Returns a list of commands in the order they should be executed.
     """
-    # Pattern for code blocks
+    commands = []
+    
+    # First try to extract complete code blocks
     code_block_pattern = r'```(?:powershell)?\n(.*?)\n```'
     code_blocks = re.findall(code_block_pattern, text, re.DOTALL)
     
-    # Pattern for inline commands (between backticks or on their own line)
-    inline_pattern = r'(?:`|^)((?:New-Item|mkdir|Set-|Get-|Remove-|Start-|Stop-|Write-|Invoke-|Select-|Where-|\$)[^`\n]+)(?:`|$)'
+    for block in code_blocks:
+        # Split block into individual commands, handling line continuations
+        block_commands = []
+        current_command = []
+        
+        for line in block.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue  # Skip empty lines and comments
+            
+            # Handle line continuations (lines ending with backtick)
+            if line.endswith('`'):
+                current_command.append(line[:-1].strip())
+            else:
+                current_command.append(line)
+                complete_command = ' '.join(current_command).strip()
+                if complete_command:
+                    block_commands.append(complete_command)
+                current_command = []
+        
+        # Add any remaining command parts
+        if current_command:
+            complete_command = ' '.join(current_command).strip()
+            if complete_command:
+                block_commands.append(complete_command)
+        
+        commands.extend(block_commands)
+    
+    # Then look for inline commands (between single backticks or on their own line)
+    inline_pattern = r'(?:`|^|\n)((?:[A-Za-z]+-[A-Za-z]+\b|mkdir|cd|cp|mv|rm|ls|cat|echo|foreach|if|while|switch|try|catch|finally|function|\$[A-Za-z0-9_]+\s*=?).*?)(?:`|$|\n)'
     inline_commands = re.findall(inline_pattern, text, re.IGNORECASE)
     
-    # Combine all potential commands
-    all_commands = []
-    for block in code_blocks:
-        all_commands.extend([cmd.strip() for cmd in block.split('\n') if cmd.strip()])
+    # Filter and add inline commands
+    for cmd in inline_commands:
+        cmd = cmd.strip()
+        if cmd and not cmd.startswith('#') and not cmd.startswith('//'):
+            # Check if this is part of a multi-line command already captured
+            if not any(cmd in existing for existing in commands):
+                commands.append(cmd)
     
-    all_commands.extend(inline_commands)
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_commands = []
+    for cmd in commands:
+        normalized_cmd = ' '.join(cmd.split())  # Normalize whitespace
+        if normalized_cmd not in seen:
+            seen.add(normalized_cmd)
+            unique_commands.append(cmd)
     
-    # Filter out comments and empty commands
-    valid_commands = [
-        cmd for cmd in all_commands 
-        if cmd and not cmd.startswith('#') and not cmd.startswith('//')
-    ]
-    
-    return valid_commands[0] if valid_commands else None
+    return unique_commands
 
-def execute_powershell_command(command):
-    """Execute a PowerShell command with safety checks and proper output handling."""
-    print(f"\nExecuting PowerShell command: {command}")
+def execute_powershell_commands(commands):
+    """Execute a list of PowerShell commands with safety checks and proper output handling."""
+    if not commands:
+        print("No valid commands to execute.")
+        return False
     
-    try:
-        # Basic safety check - don't execute potentially dangerous commands
-        if is_potentially_dangerous(command):
-            raise ValueError("Command appears potentially dangerous and was blocked")
+    overall_success = True
+    
+    for i, command in enumerate(commands, 1):
+        print(f"\nCommand {i}/{len(commands)}: {command}")
         
-        # Execute the command
-        result = subprocess.run(
-            ["pwsh", "-Command", command],
-            check=True,
-            text=True,
-            capture_output=True
-        )
-        
-        # Print results
-        if result.stdout:
-            print(f"Command output:\n{result.stdout}")
-        if result.stderr:
-            print(f"Command errors:\n{result.stderr}")
+        try:
+            # Basic safety check
+            if is_potentially_dangerous(command):
+                print(f"⚠️ Warning: Command {i} appears potentially dangerous and was skipped")
+                overall_success = False
+                continue
             
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Command failed with error: {e}")
-        print(f"Output: {e.stdout}")
-        print(f"Errors: {e.stderr}")
-        return False
-    except Exception as e:
-        print(f"Error executing command: {e}")
-        return False
+            # Execute the command
+            result = subprocess.run(
+                ["pwsh", "-Command", command],
+                check=True,
+                text=True,
+                capture_output=True
+            )
+            
+            # Print results
+            if result.stdout:
+                print(f"Output:\n{result.stdout}")
+            if result.stderr:
+                print(f"Errors:\n{result.stderr}")
+            
+            print(f"✅ Command {i} executed successfully")
+            
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Command {i} failed with error: {e}")
+            print(f"Output: {e.stdout}")
+            print(f"Errors: {e.stderr}")
+            overall_success = False
+            # Continue with next command even if one fails
+        except Exception as e:
+            print(f"❌ Unexpected error executing command {i}: {e}")
+            overall_success = False
+    
+    return overall_success
 
 def is_potentially_dangerous(command):
     """Check if a command appears to be potentially dangerous."""
@@ -152,6 +198,10 @@ def is_potentially_dangerous(command):
         r'net\s+user',
         r'reg\s+(add|delete)',
         r'schtasks\s+',
+        r'rm\s+-r',
+        r'del\s+/s',
+        r'Format-',
+        r'Clear-',
     ]
     
     lower_command = command.lower()
@@ -159,6 +209,8 @@ def is_potentially_dangerous(command):
 
 if __name__ == "__main__":
     print("DeepSeek Chat PowerShell Assistant (type 'quit' or 'exit' to end)")
+    print("Note: Multiple PowerShell commands will be executed in order.")
+    
     while True:
         try:
             user_input = input("\nYour request: ").strip()
