@@ -2,16 +2,18 @@ import requests
 import subprocess
 import os
 import shutil
+import time
 from pathlib import Path
 from pprint import pprint
 import re
 
 class GitHubProgramRunner:
-    def __init__(self, api_key):
+    def __init__(self, api_key, max_retries=3):
         self.api_key = api_key
         self.api_url = "https://api.siliconflow.cn/v1/chat/completions"
         self.workspace = Path("workspace")
         self.workspace.mkdir(exist_ok=True)
+        self.max_retries = max_retries
 
     def fetch_readme(self, repo_url):
         """Fetch README with detailed error handling"""
@@ -46,6 +48,37 @@ class GitHubProgramRunner:
         except Exception as e:
             print(f"⚠️ AI API call failed: {str(e)}")
             return None
+        
+    def ask_ai_for_solution(self, error_message, previous_commands, readme):
+        """Ask AI to diagnose and fix the problem"""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a technical problem solver. Analyze errors and suggest fixes."
+            },
+            {
+                "role": "user",
+                "content": f"""Error encountered:
+                {error_message}
+
+                Previous commands attempted:
+                {chr(10).join(previous_commands)}
+
+                README content (truncated):
+                {readme[:3000]}
+
+                Suggest:
+                1. What went wrong
+                2. New commands to try
+                3. Any necessary fixes
+
+                Return ONLY the commands to execute, one per line."""
+            }
+        ]
+        response = self.call_ai(messages)
+        if response:
+            return self.extract_commands(response['choices'][0]['message']['content'])
+        return None
 
     def clone_repo(self, repo_url):
         """Clone repository with real-time output"""
@@ -185,19 +218,23 @@ class GitHubProgramRunner:
         messages = [
             {
                 "role": "system",
-                "content": "You are a technical assistant that generates EXACT PowerShell commands to setup and run GitHub repositories. "
-                           "Provide commands that can be executed directly without modification. "
-                           "Include installation steps if needed."
+                "content": """You are a technical assistant that generates ONLY the necessary Git and Python commands to run a repository.
+                
+                RULES:
+                1. DO NOT include package installation commands (no winget, apt, brew, etc.)
+                2. ONLY provide commands that:
+                - Clone the repository
+                - Change directories
+                - Run Python files
+                - Install Python dependencies from requirements.txt
+                3. Use forward slashes (/) for paths
+                4. Format: one command per line, no numbering"""
             },
             {
                 "role": "user",
                 "content": f"Repository: {repo_url}\n\nREADME Content:\n{readme[:5000]}\n\n"
-                           f"User Request: {user_prompt}\n\n"
-                           f"Generate a numbered list of PowerShell commands to:\n"
-                           f"1. Install dependencies if needed\n"
-                           f"2. Run the program\n"
-                           f"3. Execute test cases if mentioned\n"
-                           f"Output ONLY the commands, one per line, without additional explanations."
+                        f"User Request: {user_prompt}\n\n"
+                        f"Generate the EXACT commands needed to run this repository."
             }
         ]
         
@@ -216,21 +253,95 @@ class GitHubProgramRunner:
         execution_results = self.execute_commands(commands, repo_dir)
         
         return {
-            "status": "completed",
+            "status": "completed" if all(r['returncode'] == 0 for r in execution_results) else "failed",
             "repository": repo_url,
             "readme_url": readme_url or f"{repo_url}/blob/main/README.md",
             "commands": commands,
             "execution_results": execution_results,
             "workspace": str(repo_dir)
         }
+        
+    def process_repository_with_retries(self, repo_url, user_prompt, readme_url=None):
+        """Main processing with automatic problem solving"""
+        attempts = 0
+        last_error = None
+        previous_commands = []
+        repo_dir = None
+        
+        while attempts < self.max_retries:
+            attempts += 1
+            print(f"\n🔁 Attempt {attempts}/{self.max_retries}")
+            
+            # Clone fresh if not first attempt
+            if attempts > 1:
+                if repo_dir and repo_dir.exists():
+                    shutil.rmtree(repo_dir)
+                repo_dir = self.clone_repo(repo_url)
+                if not repo_dir:
+                    continue
+            
+            # For first attempt, use normal process
+            if attempts == 1:
+                result = self.process_repository(repo_url, user_prompt, readme_url)
+            else:
+                # Execute the new commands directly
+                execution_results = self.execute_commands(new_commands, repo_dir)
+                result = {
+                    "status": "completed" if all(r['returncode'] == 0 for r in execution_results) else "failed",
+                    "repository": repo_url,
+                    "readme_url": readme_url,
+                    "commands": new_commands,
+                    "execution_results": execution_results,
+                    "workspace": str(repo_dir)
+                }
+            
+            if result["status"] == "completed":
+                return result
+            
+            # Collect error information
+            error_details = []
+            if "execution_results" in result:
+                for res in result["execution_results"]:
+                    if res.get("returncode", 0) != 0:
+                        error_details.append(f"Command: {res['command']}")
+                        error_details.append(f"Error: {res.get('stderr', res.get('error', 'Unknown error'))}")
+                        previous_commands.append(res['command'])
+            
+            last_error = "\n".join(error_details)
+            print(f"❌ Attempt failed:\n{last_error}")
+            
+            # Ask AI for solution
+            print("\n🤔 Consulting AI for solution...")
+            readme = self.fetch_readme(repo_url) or ""
+            new_commands = self.ask_ai_for_solution(last_error, previous_commands, readme)
+            
+            if not new_commands:
+                print("⚠️ AI couldn't suggest a solution")
+                break
+                
+            print("\n🔄 New commands to try:")
+            for cmd in new_commands:
+                print(f"- {cmd}")
+            
+            # Add delay between retries
+            if attempts < self.max_retries:
+                time.sleep(2)
+        
+        return {
+            "status": "failed",
+            "error": f"Failed after {attempts} attempts",
+            "last_error": last_error,
+            "repository": repo_url,
+            "attempts": attempts
+        }
 
 # Example Usage
 if __name__ == "__main__":
     API_KEY = "sk-ldlznymtwuosilumwyqsxkusuwllbzbvcmviebypcbqnxsso"
-    runner = GitHubProgramRunner(API_KEY)
+    runner = GitHubProgramRunner(API_KEY, max_retries=3)
     
     # Test with a simple repository
-    result = runner.process_repository(
+    result = runner.process_repository_with_retries(
         repo_url="https://github.com/leachim6/hello-world",
         user_prompt="Run the python 3.py in the repo",
         readme_url="https://github.com/leachim6/hello-world/blob/main/readme.md",
